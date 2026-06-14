@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+
+*.log
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+checkpoints/
+logs/
+results/
+outputs/
+
+.idea/
+.vscode/
+.DS_Store
+
+# Local dataset directories or symbolic links
+/drugbank
+/inductive_data
+/twosides
+
+# Temporary backups
+*.bak
+environment_full.yml
