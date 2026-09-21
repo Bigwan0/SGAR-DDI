@@ -20,12 +20,6 @@ conda env create -f environment.yml
 conda activate sgar_ddi
 ```
 
-Alternatively:
-
-```bash
-bash Install
-conda activate sgar_ddi
-```
 
 ## Dataset
 
@@ -56,3 +50,5 @@ python "twosides_test/train_script.py" --repeat 0 --seed 0
 ```
 
 Use repeat/fold values `0`, `1`, and `2` for the three experimental runs.
+```text
+Update README installation instructions
