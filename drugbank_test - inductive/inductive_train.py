@@ -1,604 +1,1079 @@
-import copy
 from datetime import datetime
-import time 
-import argparse
+from pathlib import Path
+import argparse, random, time, warnings
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch import optim
 from sklearn import metrics
-import pandas as pd
-import numpy as np
+from torch import optim
 
 import models
 import custom_loss
-from data_preprocessing import DrugDataset, DrugDataLoader
-import warnings
-warnings.filterwarnings('ignore',category=UserWarning)
+from data_preprocessing import (
+    DrugDataset, DrugDataLoader, configure_ddi_statistics,
+    load_fg_enrichment_scores, precompute_functional_groups,
+)
 
-######################### Parameters ######################
+warnings.filterwarnings('ignore', category=UserWarning)
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--n_atom_feats', type=int, default=55, help='num of input features')
-parser.add_argument('--n_atom_hid', type=int, default=128, help='num of hidden features')
-parser.add_argument('--rel_total', type=int, default=86, help='num of interaction types')
-parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
-parser.add_argument('--n_epochs', type=int, default=200, help='num of epochs')
-parser.add_argument('--kge_dim', type=int, default=128, help='dimension of interaction matrix')
-parser.add_argument('--batch_size', type=int, default=256, help='batch size')
-
+parser.add_argument('--n_atom_feats', type=int, default=55)
+parser.add_argument('--n_atom_hid', type=int, default=128)
+parser.add_argument('--rel_total', type=int, default=86)
+parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--n_epochs', type=int, default=200)
+parser.add_argument('--kge_dim', type=int, default=128)
+parser.add_argument('--batch_size', type=int, default=1024)
 parser.add_argument('--weight_decay', type=float, default=5e-4)
 parser.add_argument('--neg_samples', type=int, default=1)
-parser.add_argument('--data_size_ratio', type=int, default=1)
-parser.add_argument('--use_cuda', type=bool, default=True, choices=[0, 1])
+parser.add_argument('--data_size_ratio', type=float, default=1.0)
+parser.add_argument('--use_cuda', type=int, default=1, choices=[0, 1])
 parser.add_argument('--pkl_name', type=str, default='inductive.pkl')
+parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2])
+parser.add_argument('--seed', type=int, default=0)
 
-# Early stopping parameters
-parser.add_argument('--patience', type=int, default=15, help='early stopping patience')
-parser.add_argument('--min_delta', type=float, default=0.001, help='minimum improvement for early stopping')
+# Validation-only early stopping.
+parser.add_argument('--patience', type=int, default=15)
+parser.add_argument('--min_delta', type=float, default=0.001)
 
-# NEW: Separate model saving parameters
-parser.add_argument('--s1_pkl_name', type=str, default='inductive_s1_best.pkl', help='best model for S1')
-parser.add_argument('--s2_pkl_name', type=str, default='inductive_s2_best.pkl', help='best model for S2')
+# Same Stage04 CL definition/defaults as frozen Full SGAR.
+parser.add_argument('--cl_weight', type=float, default=0.05)
+parser.add_argument('--cl_mask_ratio', type=float, default=0.10)
+parser.add_argument('--cl_temperature', type=float, default=0.20)
 
 args = parser.parse_args()
-n_atom_feats = args.n_atom_feats
-n_atom_hid = args.n_atom_hid
-rel_total = args.rel_total
-lr = args.lr
-n_epochs = args.n_epochs
-kge_dim = args.kge_dim
-batch_size = args.batch_size
+
+CL_WEIGHT = args.cl_weight
+CL_MASK_RATIO = args.cl_mask_ratio
+CL_TEMPERATURE = args.cl_temperature
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+device = (
+    'cuda:0'
+    if torch.cuda.is_available() and args.use_cuda
+    else 'cpu'
+)
+
 pkl_name = args.pkl_name
 
-weight_decay = args.weight_decay
-neg_samples = args.neg_samples
-data_size_ratio = args.data_size_ratio
-patience = args.patience
-min_delta = args.min_delta
-s1_pkl_name = args.s1_pkl_name
-s2_pkl_name = args.s2_pkl_name
-device = 'cuda:0' if torch.cuda.is_available() and args.use_cuda else 'cpu'
+if pkl_name == 'inductive.pkl':
+    pkl_name = (
+        f'inductive_drugbank_'
+        f'fold{args.fold}_seed{args.seed}.pkl'
+    )
+
+# ============================================================
+# Frozen clean protocol
+# ============================================================
+
+protocol_dir = (
+    Path(__file__).resolve().parents[1]
+    / 'protocol'
+    / 'drugbank_inductive'
+    / f'fold{args.fold}'
+)
+
+
+def to_tuples(df):
+    return [
+        (str(h), str(t), int(r))
+        for h, t, r in zip(
+            df.d1,
+            df.d2,
+            df.type,
+        )
+    ]
+
+
+train_tup = to_tuples(
+    pd.read_csv(
+        protocol_dir / 'train.csv'
+    )
+)
+
+val_tup = to_tuples(
+    pd.read_csv(
+        protocol_dir / 'val.csv'
+    )
+)
+
+s1_tup = to_tuples(
+    pd.read_csv(
+        protocol_dir / 's1.csv'
+    )
+)
+
+s2_tup = to_tuples(
+    pd.read_csv(
+        protocol_dir / 's2.csv'
+    )
+)
+
+# ============================================================
+# TRAIN-ONLY statistics
+# ============================================================
+
+ddi_info = configure_ddi_statistics(
+    train_tup
+)
+
+fg_info = load_fg_enrichment_scores(
+    protocol_dir / 'fg_statistics.csv'
+)
+
+precompute_functional_groups()
+
 print(args)
-############################################################
+print(f'[device] {device}')
 
-###### Dataset
-df_ddi_train = pd.read_csv('inductive_data/fold1/train.csv')
-df_ddi_s1 = pd.read_csv('inductive_data/fold1/s1.csv')
-df_ddi_s2 = pd.read_csv('inductive_data/fold1/s2.csv')
+print(
+    f'[clean fold] '
+    f'train={len(train_tup)} '
+    f'val={len(val_tup)} '
+    f'S1={len(s1_tup)} '
+    f'S2={len(s2_tup)}'
+)
 
+print(
+    f"[train-only DDI] "
+    f"triples={ddi_info['num_triples']} "
+    f"drugs={ddi_info['num_drugs']} "
+    f"relations={ddi_info['num_relations']}"
+)
 
-train_tup = [(h, t, r) for h, t, r in zip(df_ddi_train['d1'], df_ddi_train['d2'], df_ddi_train['type'])]
-s1_tup = [(h, t, r) for h, t, r in zip(df_ddi_s1['d1'], df_ddi_s1['d2'], df_ddi_s1['type'])]
-s2_tup = [(h, t, r) for h, t, r in zip(df_ddi_s2['d1'], df_ddi_s2['d2'], df_ddi_s2['type'])]
+print(
+    f"[train-only FG] "
+    f"rows={fg_info['rows']} "
+    f"min/median/max="
+    f"{fg_info['min_enrichment']:.6f}/"
+    f"{fg_info['median_enrichment']:.6f}/"
+    f"{fg_info['max_enrichment']:.6f}"
+)
 
-train_data = DrugDataset(train_tup, ratio=data_size_ratio, neg_ent=neg_samples)
-s1_data = DrugDataset(s1_tup, disjoint_split=True)
-s2_data = DrugDataset(s2_tup, disjoint_split=True)
+print(
+    f'[Stage04-CL] '
+    f'weight={CL_WEIGHT} '
+    f'mask_ratio={CL_MASK_RATIO} '
+    f'temperature={CL_TEMPERATURE}'
+)
 
-print(f"Training with {len(train_data)} samples, s1 with {len(s1_data)}, and s2 with {len(s2_data)}")
+# ============================================================
+# Dataset
+#
+# train : dynamic negatives using train-only statistics
+# val   : frozen negatives
+# S1    : frozen negatives
+# S2    : frozen negatives
+# ============================================================
 
-train_data_loader = DrugDataLoader(train_data, batch_size=batch_size, shuffle=True,num_workers=2)
-s1_data_loader = DrugDataLoader(s1_data, batch_size=batch_size *3,num_workers=2)
-s2_data_loader = DrugDataLoader(s2_data, batch_size=batch_size *3,num_workers=2)
+train_data = DrugDataset(
+    train_tup,
+    ratio=args.data_size_ratio,
+    neg_ent=args.neg_samples,
+    disjoint_split=True,
+    shuffle=True,
+)
 
+val_data = DrugDataset(
+    val_tup,
+    disjoint_split=True,
+    shuffle=False,
+    fixed_negative_file=(
+        protocol_dir / 'val_negatives.csv'
+    ),
+)
 
-CL_WEIGHT = 0.05
-CL_MASK_RATIO = 0.10
-CL_TEMPERATURE = 0.20
+s1_data = DrugDataset(
+    s1_tup,
+    disjoint_split=True,
+    shuffle=False,
+    fixed_negative_file=(
+        protocol_dir / 's1_negatives.csv'
+    ),
+)
 
-
-def _clone_data_obj(data):
-    if hasattr(data, 'clone'):
-        return data.clone()
-    return copy.deepcopy(data)
-
-
-def _mask_node_features(data, mask_ratio=CL_MASK_RATIO):
-    data = _clone_data_obj(data)
-    if (not hasattr(data, 'x')) or data.x is None or data.x.numel() == 0:
-        return data
-
-    x = data.x.clone()
-    num_nodes = x.size(0)
-    if num_nodes == 0:
-        data.x = x
-        return data
-
-    num_mask = max(1, int(num_nodes * mask_ratio))
-    perm = torch.randperm(num_nodes, device=x.device)[:num_mask]
-    x[perm] = 0.0
-    data.x = x
-    return data
-
-
-def _augment_positive_triple(pos_tri, mask_ratio=CL_MASK_RATIO):
-    h_data, t_data, rels, b_graph = pos_tri
-    h_aug = _mask_node_features(h_data, mask_ratio)
-    t_aug = _mask_node_features(t_data, mask_ratio)
-    b_aug = _clone_data_obj(b_graph)
-    return h_aug, t_aug, rels, b_aug
-
-
-def _info_nce(z1, z2, temperature=CL_TEMPERATURE):
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
-    logits = torch.matmul(z1, z2.transpose(0, 1)) / temperature
-    labels = torch.arange(z1.size(0), device=z1.device)
-    loss_12 = F.cross_entropy(logits, labels)
-    loss_21 = F.cross_entropy(logits.transpose(0, 1), labels)
-    return 0.5 * (loss_12 + loss_21)
-
-
-def _mask_x_tensor(x, mask_ratio=CL_MASK_RATIO):
-    x = x.detach().clone()
-    if x.numel() == 0:
-        return x
-
-    num_nodes = x.size(0)
-    if num_nodes == 0:
-        return x
-
-    num_mask = max(1, int(num_nodes * mask_ratio))
-    perm = torch.randperm(num_nodes, device=x.device)[:num_mask]
-    x[perm] = 0.0
-    return x
+s2_data = DrugDataset(
+    s2_tup,
+    disjoint_split=True,
+    shuffle=False,
+    fixed_negative_file=(
+        protocol_dir / 's2_negatives.csv'
+    ),
+)
 
 
-def _compute_cl_loss(model, pos_tri, h_last_base, t_last_base, h_x_orig, t_x_orig,
-                     mask_ratio=CL_MASK_RATIO, temperature=CL_TEMPERATURE):
-    h_data, t_data, rels, b_graph = pos_tri
+def seed_worker(_):
+    worker_seed = (
+        torch.initial_seed()
+        % (2 ** 32)
+    )
 
-    h_proj = model.cl_proj(h_last_base.detach())
-    t_proj = model.cl_proj(t_last_base.detach())
-
-    h_saved = h_data.x
-    t_saved = t_data.x
-
-    try:
-        h_data.x = _mask_x_tensor(h_x_orig, mask_ratio)
-        t_data.x = _mask_x_tensor(t_x_orig, mask_ratio)
-
-        _, h_last_aug, t_last_aug = model((h_data, t_data, rels, b_graph), return_last_repr=True)
-    finally:
-        h_data.x = h_saved
-        t_data.x = t_saved
-
-    h_proj_aug = model.cl_proj(h_last_aug)
-    t_proj_aug = model.cl_proj(t_last_aug)
-
-    loss_h = _info_nce(h_proj, h_proj_aug, temperature)
-    loss_t = _info_nce(t_proj, t_proj_aug, temperature)
-    return 0.5 * (loss_h + loss_t)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
-def do_compute(batch, device, model, compute_cl=False):
-    '''
-        *batch: (pos_tri, neg_tri)
-        *pos/neg_tri: (batch_h, batch_t, batch_r)
-    '''
-    probas_pred, ground_truth, rel_types = [], [], []
-    pos_tri, neg_tri = batch
-    
-    pos_tri = [tensor.to(device=device) for tensor in pos_tri]
-    h_x_orig = pos_tri[0].x.detach().clone()
-    t_x_orig = pos_tri[1].x.detach().clone()
-    p_score, h_last_base, t_last_base = model(pos_tri, return_last_repr=True)
-    probas_pred.append(torch.sigmoid(p_score.detach()).cpu())
-    ground_truth.append(np.ones(len(p_score)))
-    # Ensure rel_types are properly squeezed to 1D array
-    rel_types.append(pos_tri[2].squeeze().cpu().numpy())
+def generator(offset):
+    g = torch.Generator()
 
-    neg_tri = [tensor.to(device=device) for tensor in neg_tri]
-    n_score = model(neg_tri)
-    probas_pred.append(torch.sigmoid(n_score.detach()).cpu())
-    ground_truth.append(np.zeros(len(n_score)))
-    # Ensure rel_types are properly squeezed to 1D array
-    rel_types.append(neg_tri[2].squeeze().cpu().numpy())
+    g.manual_seed(
+        args.seed + offset
+    )
 
-    probas_pred = np.concatenate(probas_pred)
-    ground_truth = np.concatenate(ground_truth)
-    # Flatten each array before concatenating if needed
-    rel_types = [rt.flatten() if rt.ndim > 1 else rt for rt in rel_types]
-    rel_types = np.concatenate(rel_types)
-
-    if compute_cl:
-        cl_loss = _compute_cl_loss(model, pos_tri, h_last_base, t_last_base, h_x_orig, t_x_orig)
-        return p_score, n_score, probas_pred, ground_truth, rel_types, cl_loss
-
-    return p_score, n_score, probas_pred, ground_truth, rel_types
-
-def do_compute_metrics(probas_pred, target, rel_types=None, per_rel=False):
-    pred = (probas_pred >= 0.5).astype(int)
-    acc = metrics.accuracy_score(target, pred)
-    auroc = metrics.roc_auc_score(target, probas_pred)
-    f1_score = metrics.f1_score(target, pred)
-    precision = metrics.precision_score(target, pred)
-    recall = metrics.recall_score(target, pred)
-    p, r, t = metrics.precision_recall_curve(target, probas_pred)
-    int_ap = metrics.auc(r, p)
-    ap= metrics.average_precision_score(target, probas_pred)
-
-    # If we want per-relation metrics and relation types are provided
-    if per_rel and rel_types is not None:
-        # Create a dictionary to store metrics per relation type
-        rel_metrics = {}
-        unique_rels = np.unique(rel_types)
-        
-        for rel in unique_rels:
-            rel_mask = rel_types == rel
-            # Convert target to numpy array if it's not already
-            target_array = np.array(target)
-            # Check if we have positive and negative examples
-            if sum(rel_mask) > 0 and sum(target_array[rel_mask]) > 0 and sum(1 - target_array[rel_mask]) > 0:
-                try:
-                    rel_pred = pred[rel_mask]
-                    rel_target = target_array[rel_mask]
-                    rel_probas = probas_pred[rel_mask]
-                    
-                    rel_acc = metrics.accuracy_score(rel_target, rel_pred)
-                    rel_auroc = metrics.roc_auc_score(rel_target, rel_probas)
-                    rel_f1 = metrics.f1_score(rel_target, rel_pred)
-                    rel_precision = metrics.precision_score(rel_target, rel_pred)
-                    rel_recall = metrics.recall_score(rel_target, rel_pred)
-                    rel_p, rel_r, rel_t = metrics.precision_recall_curve(rel_target, rel_probas)
-                    rel_int_ap = metrics.auc(rel_r, rel_p)
-                    rel_ap = metrics.average_precision_score(rel_target, rel_probas)
-                    
-                    rel_metrics[rel] = {
-                        'acc': rel_acc,
-                        'auroc': rel_auroc,
-                        'f1': rel_f1,
-                        'precision': rel_precision,
-                        'recall': rel_recall,
-                        'int_ap': rel_int_ap,
-                        'ap': rel_ap
-                    }
-                except Exception as e:
-                    # Handle cases where metrics cannot be calculated
-                    rel_metrics[rel] = {'error': str(e)}
-            else:
-                rel_metrics[rel] = {'error': 'Insufficient samples for both classes'}
-        
-        return acc, auroc, f1_score, precision, recall, int_ap, ap, rel_metrics
-    
-    return acc, auroc, f1_score, precision, recall, int_ap, ap
+    return g
 
 
-def train(model, train_data_loader, s1_data_loader, s2_data_loader, loss_fn, optimizer, n_epochs, device, scheduler=None):
-    print('Starting training at', datetime.today())
-    
-    # Separate tracking for S1 and S2 best models
-    best_s1_acc = 0
-    best_s2_acc = 0
-    best_s1_epoch = 0
-    best_s2_epoch = 0
-    patience_counter = 0
-    
-    for i in range(1, n_epochs+1):
-        start = time.time()
-        train_loss = 0 
-        s1_loss = 0
-        s2_loss = 0
-      
-        train_probas_pred = []
-        train_ground_truth = []
-        train_rel_types = []
+train_loader = DrugDataLoader(
+    train_data,
+    batch_size=args.batch_size,
+    shuffle=True,
+    num_workers=2,
+    worker_init_fn=seed_worker,
+    generator=generator(11),
+)
 
-        s1_probas_pred = []
-        s1_ground_truth = []
-        s1_rel_types = []
+val_loader = DrugDataLoader(
+    val_data,
+    batch_size=args.batch_size * 3,
+    shuffle=False,
+    num_workers=2,
+    worker_init_fn=seed_worker,
+    generator=generator(22),
+)
 
-        s2_probas_pred = []
-        s2_ground_truth = []
-        s2_rel_types = []
+s1_loader = DrugDataLoader(
+    s1_data,
+    batch_size=args.batch_size * 3,
+    shuffle=False,
+    num_workers=2,
+    worker_init_fn=seed_worker,
+    generator=generator(33),
+)
 
-        for batch in train_data_loader:
-            model.train()
-            p_score, n_score, probas_pred, ground_truth, rel_types, cl_loss = do_compute(batch, device, model, compute_cl=True)
-            train_probas_pred.append(probas_pred)
-            train_ground_truth.append(ground_truth)
-            train_rel_types.append(rel_types)
-            loss, loss_p, loss_n = loss_fn(p_score, n_score)
-            
-            optimizer.zero_grad()
-            ddi_loss = loss
-            loss = ddi_loss + CL_WEIGHT * cl_loss
-            loss.backward()
-            optimizer.step()
+s2_loader = DrugDataLoader(
+    s2_data,
+    batch_size=args.batch_size * 3,
+    shuffle=False,
+    num_workers=2,
+    worker_init_fn=seed_worker,
+    generator=generator(44),
+)
 
-            train_loss += loss.item() * len(p_score)
-        train_loss /= len(train_data)
-
-        with torch.no_grad():
-            train_probas_pred = np.concatenate(train_probas_pred)
-            train_ground_truth = np.concatenate(train_ground_truth)
-            train_rel_types = np.concatenate(train_rel_types)
-
-            train_acc, train_auc_roc, train_f1, train_precision, train_recall, train_int_ap, train_ap = do_compute_metrics(train_probas_pred, train_ground_truth)
-
-            for batch in s1_data_loader:
-                model.eval()
-                p_score, n_score, probas_pred, ground_truth, rel_types = do_compute(batch, device, model)
-                s1_probas_pred.append(probas_pred)
-                s1_ground_truth.append(ground_truth)
-                s1_rel_types.append(rel_types)
-                loss, loss_p, loss_n = loss_fn(p_score, n_score)
-                s1_loss += loss.item() * len(p_score)            
-
-            s1_loss /= len(s1_data)
-            s1_probas_pred = np.concatenate(s1_probas_pred)
-            s1_ground_truth = np.concatenate(s1_ground_truth)
-            s1_rel_types = np.concatenate(s1_rel_types)
-            s1_acc, s1_auc_roc, s1_f1, s1_precision, s1_recall, s1_int_ap, s1_ap = do_compute_metrics(s1_probas_pred, s1_ground_truth)
-        
-            for batch in s2_data_loader:
-                model.eval()
-                p_score, n_score, probas_pred, ground_truth, rel_types = do_compute(batch, device, model)
-                s2_probas_pred.append(probas_pred)
-                s2_ground_truth.append(ground_truth)
-                s2_rel_types.append(rel_types)
-                loss, loss_p, loss_n = loss_fn(p_score, n_score)
-                s2_loss += loss.item() * len(p_score)            
-
-            s2_loss /= len(s2_data)
-            s2_probas_pred = np.concatenate(s2_probas_pred)
-            s2_ground_truth = np.concatenate(s2_ground_truth)
-            s2_rel_types = np.concatenate(s2_rel_types)
-            s2_acc, s2_auc_roc, s2_f1, s2_precision, s2_recall, s2_int_ap, s2_ap = do_compute_metrics(s2_probas_pred, s2_ground_truth)
-
-            # UPDATED: Track improvements for both S1 and S2 separately
-            s1_improved = False
-            s2_improved = False
-            overall_improved = False
-            
-            # Check S1 improvement
-            if s1_acc > best_s1_acc + min_delta:
-                best_s1_acc = s1_acc
-                best_s1_epoch = i
-                s1_improved = True
-                overall_improved = True
-                torch.save(model, s1_pkl_name)
-                print(f"*** New best S1 model saved at epoch {i} with S1 acc: {s1_acc:.4f} ***")
-            
-            # Check S2 improvement  
-            if s2_acc > best_s2_acc + min_delta:
-                best_s2_acc = s2_acc
-                best_s2_epoch = i
-                s2_improved = True
-                overall_improved = True
-                torch.save(model, s2_pkl_name)
-                print(f"*** New best S2 model saved at epoch {i} with S2 acc: {s2_acc:.4f} ***")
-            
-            # Update patience counter based on overall improvement
-            if overall_improved:
-                patience_counter = 0
-            else:
-                patience_counter += 1
-               
-        if scheduler:
-            scheduler.step()
-
-        print(f'Epoch: {i} ({time.time() - start:.4f}s), train_loss: {train_loss:.4f}, s1_loss: {s1_loss:.4f}, s2_loss: {s2_loss:.4f}')
-        print(f'\t\ttrain_acc: {train_acc:.4f}, train_roc: {train_auc_roc:.4f}, train_precision: {train_precision:.4f}, train_recall: {train_recall:.4f}')
-        print(f'\t\ts1_acc: {s1_acc:.4f}, s1_roc: {s1_auc_roc:.4f}, s1_precision: {s1_precision:.4f}, s1_recall: {s1_recall:.4f}')
-        print(f'\t\ts2_acc: {s2_acc:.4f}, s2_roc: {s2_auc_roc:.4f}, s2_precision: {s2_precision:.4f}, s2_recall: {s2_recall:.4f}')
-        if hasattr(model, 'blocks'):
-            gamma_vals = []
-            for bi, blk in enumerate(model.blocks):
-                if hasattr(blk, 'raw_gamma'):
-                    gv = torch.nn.functional.softplus(blk.raw_gamma).item()
-                    gamma_vals.append(f'b{bi}:{gv:.4f}')
-            if gamma_vals:
-                print('\t\tgamma(s): ' + ', '.join(gamma_vals))
-        
-        if overall_improved:
-            improvement_msg = []
-            if s1_improved:
-                improvement_msg.append("S1")
-            if s2_improved:
-                improvement_msg.append("S2")
-            print(f'\t\t*** IMPROVEMENT ({"/".join(improvement_msg)}) *** (Patience: {patience_counter}/{patience})')
-        else:
-            print(f'\t\tNo improvement (Patience: {patience_counter}/{patience})')
-        
-        # Early stopping check
-        if patience_counter >= patience:
-            print(f'\nEarly stopping at epoch {i}!')
-            print(f'Best S1 model was at epoch {best_s1_epoch} with S1 acc: {best_s1_acc:.4f}')
-            print(f'Best S2 model was at epoch {best_s2_epoch} with S2 acc: {best_s2_acc:.4f}')
-            break
-
-    print(f'\nTraining completed.')
-    print(f'Best S1 model: epoch {best_s1_epoch}, S1 acc: {best_s1_acc:.4f}')
-    print(f'Best S2 model: epoch {best_s2_epoch}, S2 acc: {best_s2_acc:.4f}')
+# ============================================================
+# Stage04 CL
+# ============================================================
 
 
-def test_single_dataset(data_loader, model, dataset_name):
-    probas_pred = []
-    ground_truth = []
-    rel_types = []
-    
-    with torch.no_grad():
-        for batch in data_loader:
-            model.eval()
-            p_score, n_score, batch_probas_pred, batch_ground_truth, batch_rel_types = do_compute(batch, device, model=model)
-            probas_pred.append(batch_probas_pred)
-            ground_truth.append(batch_ground_truth)
-            rel_types.append(batch_rel_types)
-      
-        probas_pred = np.concatenate(probas_pred)
-        ground_truth = np.concatenate(ground_truth)
-        rel_types = np.concatenate(rel_types)
-        
-        # Get overall metrics
-        acc, auc_roc, f1, precision, recall, int_ap, ap = do_compute_metrics(probas_pred, ground_truth)
-        
-        # Get per-relation metrics
-        _, _, _, _, _, _, _, rel_metrics = do_compute_metrics(probas_pred, ground_truth, rel_types, per_rel=True)
+def info_nce(z1, z2):
 
-    print(f'{dataset_name} Results (using best {dataset_name} model):')
-    print(f'\t\t{dataset_name.lower()}_acc: {acc:.4f}, {dataset_name.lower()}_roc: {auc_roc:.4f}, {dataset_name.lower()}_f1: {f1:.4f}, {dataset_name.lower()}_precision: {precision:.4f}, {dataset_name.lower()}_recall: {recall:.4f}, {dataset_name.lower()}_int_ap: {int_ap:.4f}, {dataset_name.lower()}_ap: {ap:.4f}')
-    
+    z1 = F.normalize(
+        z1,
+        dim=-1,
+    )
+
+    z2 = F.normalize(
+        z2,
+        dim=-1,
+    )
+
+    logits = (
+        z1 @ z2.T
+        / CL_TEMPERATURE
+    )
+
+    labels = torch.arange(
+        z1.size(0),
+        device=z1.device,
+    )
+
+    return 0.5 * (
+        F.cross_entropy(
+            logits,
+            labels,
+        )
+        +
+        F.cross_entropy(
+            logits.T,
+            labels,
+        )
+    )
+
+
+def mask_x(x):
+
+    out = x.detach().clone()
+
+    if (
+        out.numel() == 0
+        or out.size(0) == 0
+        or CL_MASK_RATIO <= 0
+    ):
+        return out
+
+    n = min(
+        max(
+            1,
+            int(
+                out.size(0)
+                * CL_MASK_RATIO
+            ),
+        ),
+        out.size(0),
+    )
+
+    idx = torch.randperm(
+        out.size(0),
+        device=out.device,
+    )[:n]
+
+    out[idx] = 0.0
+
+    return out
+
+
+def compute_cl(
+    model,
+    raw,
+    h_base,
+    t_base,
+):
+
+    h, t, r, b = raw
+
+    h_aug = h.clone()
+    t_aug = t.clone()
+    b_aug = b.clone()
+
+    h_aug.x = mask_x(
+        h_aug.x
+    )
+
+    t_aug.x = mask_x(
+        t_aug.x
+    )
+
+    (
+        _,
+        h_last_aug,
+        t_last_aug,
+    ) = model(
+        (
+            h_aug,
+            t_aug,
+            r,
+            b_aug,
+        ),
+        return_last_repr=True,
+    )
+
+    loss_h = info_nce(
+        model.cl_proj(h_base),
+        model.cl_proj(h_last_aug),
+    )
+
+    loss_t = info_nce(
+        model.cl_proj(t_base),
+        model.cl_proj(t_last_aug),
+    )
+
+    return 0.5 * (
+        loss_h + loss_t
+    )
+
+
+def do_compute(
+    batch,
+    model,
+    use_cl=False,
+):
+
+    pos, neg = batch
+
+    pos = [
+        x.to(device)
+        for x in pos
+    ]
+
+    if use_cl:
+
+        # Keep untouched copies because
+        # the model mutates x internally.
+        raw = (
+            pos[0].clone(),
+            pos[1].clone(),
+            pos[2],
+            pos[3].clone(),
+        )
+
+        (
+            p_score,
+            h_base,
+            t_base,
+        ) = model(
+            pos,
+            return_last_repr=True,
+        )
+
+        cl_loss = compute_cl(
+            model,
+            raw,
+            h_base,
+            t_base,
+        )
+
+    else:
+
+        p_score = model(pos)
+
+        cl_loss = torch.zeros(
+            (),
+            device=device,
+        )
+
+    neg = [
+        x.to(device)
+        for x in neg
+    ]
+
+    n_score = model(neg)
+
+    prob = np.concatenate([
+        torch.sigmoid(
+            p_score.detach()
+        ).cpu().numpy(),
+
+        torch.sigmoid(
+            n_score.detach()
+        ).cpu().numpy(),
+    ])
+
+    target = np.concatenate([
+        np.ones(
+            len(p_score)
+        ),
+        np.zeros(
+            len(n_score)
+        ),
+    ])
+
+    rels = np.concatenate([
+        pos[2]
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1),
+
+        neg[2]
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1),
+    ])
+
+    return (
+        p_score,
+        n_score,
+        prob,
+        target,
+        rels,
+        cl_loss,
+    )
+
+# ============================================================
+# Metrics
+# ============================================================
+
+
+def metric_dict(
+    prob,
+    target,
+):
+
+    pred = (
+        prob >= 0.5
+    ).astype(int)
+
     return {
-        'acc': acc, 'auroc': auc_roc, 'f1': f1, 'precision': precision, 
-        'recall': recall, 'int_ap': int_ap, 'ap': ap, 'rel_metrics': rel_metrics,
-        'dataset': dataset_name, 'probas_pred': probas_pred, 'ground_truth': ground_truth, 'rel_types': rel_types
+        'acc':
+            metrics.accuracy_score(
+                target,
+                pred,
+            ),
+
+        'auroc':
+            metrics.roc_auc_score(
+                target,
+                prob,
+            ),
+
+        'f1':
+            metrics.f1_score(
+                target,
+                pred,
+            ),
+
+        'precision':
+            metrics.precision_score(
+                target,
+                pred,
+                zero_division=0,
+            ),
+
+        'recall':
+            metrics.recall_score(
+                target,
+                pred,
+                zero_division=0,
+            ),
+
+        'ap':
+            metrics.average_precision_score(
+                target,
+                prob,
+            ),
     }
 
 
-def test_separate_models(s1_data_loader, s2_data_loader):
-    print('\n')
-    print('============================== Testing with Separate Best Models ==============================')
-    
-    # Test S1 with best S1 model
-    print('Testing S1 with best S1 model...')
-    s1_best_model = torch.load(s1_pkl_name)
-    s1_results = test_single_dataset(s1_data_loader, s1_best_model, 'S1')
-    
-    # Test S2 with best S2 model  
-    print('Testing S2 with best S2 model...')
-    s2_best_model = torch.load(s2_pkl_name)
-    s2_results = test_single_dataset(s2_data_loader, s2_best_model, 'S2')
-    
-    # Create combined per-ADR results table
-    print('\n')
-    print('============================== Per-ADR Results ==============================')
-    
-    # Create a combined DataFrame for both S1 and S2 results
-    adr_data = []
-    
-    # Add S1 overall metrics first
-    s1_res = s1_results
-    adr_data.append({
-        'ADR_Type': 'Overall_S1',
-        'Accuracy': s1_res['acc'],
-        'AUROC': s1_res['auroc'],
-        'F1': s1_res['f1'],
-        'Precision': s1_res['precision'],
-        'Recall': s1_res['recall'],
-        'Int_AP': s1_res['int_ap'],
-        'AP': s1_res['ap'],
-        'Dataset': 'S1'
-    })
-    
-    # Add S1 per-ADR metrics
-    for rel, metrics_dict in s1_res['rel_metrics'].items():
-        if isinstance(metrics_dict, dict) and 'error' not in metrics_dict:
-            adr_data.append({
-                'ADR_Type': rel,
-                'Accuracy': metrics_dict['acc'],
-                'AUROC': metrics_dict['auroc'],
-                'F1': metrics_dict['f1'],
-                'Precision': metrics_dict['precision'],
-                'Recall': metrics_dict['recall'],
-                'Int_AP': metrics_dict['int_ap'],
-                'AP': metrics_dict['ap'],
-                'Dataset': 'S1'
-            })
+def evaluate(
+    loader,
+    model,
+    loss_fn,
+    per_rel=False,
+):
+
+    model.eval()
+
+    total_loss = 0.0
+
+    probs = []
+    targets = []
+    rels_all = []
+
+    with torch.no_grad():
+
+        for batch in loader:
+
+            (
+                p,
+                n,
+                prob,
+                target,
+                rels,
+                _,
+            ) = do_compute(
+                batch,
+                model,
+                use_cl=False,
+            )
+
+            batch_loss, _, _ = (
+                loss_fn(
+                    p,
+                    n,
+                )
+            )
+
+            total_loss += (
+                batch_loss.item()
+                * len(p)
+            )
+
+            probs.append(prob)
+            targets.append(target)
+            rels_all.append(rels)
+
+    prob = np.concatenate(
+        probs
+    )
+
+    target = np.concatenate(
+        targets
+    )
+
+    rels = np.concatenate(
+        rels_all
+    )
+
+    out = metric_dict(
+        prob,
+        target,
+    )
+
+    out['loss'] = (
+        total_loss
+        / len(loader.dataset)
+    )
+
+    if per_rel:
+
+        per = {}
+
+        for rel in np.unique(
+            rels
+        ):
+
+            mask = (
+                rels == rel
+            )
+
+            if (
+                target[mask].sum() == 0
+                or
+                (
+                    1
+                    - target[mask]
+                ).sum() == 0
+            ):
+
+                per[int(rel)] = {
+                    'error':
+                        'Insufficient samples '
+                        'for both classes'
+                }
+
+            else:
+
+                per[int(rel)] = (
+                    metric_dict(
+                        prob[mask],
+                        target[mask],
+                    )
+                )
+
+        out['per_rel'] = per
+
+    return out
+
+# ============================================================
+# Training
+#
+# CRITICAL:
+# S1 and S2 NEVER enter this function.
+# ============================================================
+
+
+def train(
+    model,
+    loss_fn,
+    optimizer,
+    scheduler,
+):
+
+    print(
+        'Starting training at',
+        datetime.today(),
+    )
+
+    best_acc = float('-inf')
+    best_epoch = 0
+    patience_counter = 0
+
+    for epoch in range(
+        1,
+        args.n_epochs + 1,
+    ):
+
+        start = time.time()
+
+        total_sum = 0.0
+        ddi_sum = 0.0
+        cl_sum = 0.0
+
+        probs = []
+        targets = []
+
+        for batch in train_loader:
+
+            model.train()
+
+            (
+                p,
+                n,
+                prob,
+                target,
+                _,
+                cl_loss,
+            ) = do_compute(
+                batch,
+                model,
+                use_cl=True,
+            )
+
+            ddi_loss, _, _ = (
+                loss_fn(
+                    p,
+                    n,
+                )
+            )
+
+            total_loss = (
+                ddi_loss
+                +
+                CL_WEIGHT
+                * cl_loss
+            )
+
+            optimizer.zero_grad()
+
+            total_loss.backward()
+
+            optimizer.step()
+
+            k = len(p)
+
+            total_sum += (
+                total_loss.item()
+                * k
+            )
+
+            ddi_sum += (
+                ddi_loss.item()
+                * k
+            )
+
+            cl_sum += (
+                cl_loss.item()
+                * k
+            )
+
+            probs.append(prob)
+            targets.append(target)
+
+        train_m = metric_dict(
+            np.concatenate(probs),
+            np.concatenate(targets),
+        )
+
+        # DDI-only validation.
+        val_m = evaluate(
+            val_loader,
+            model,
+            loss_fn,
+            per_rel=False,
+        )
+
+        # Keep the same selection metric as
+        # frozen clean transductive protocol:
+        # validation ACC.
+        improved = (
+            val_m['acc']
+            >
+            best_acc
+            + args.min_delta
+        )
+
+        if improved:
+
+            best_acc = (
+                val_m['acc']
+            )
+
+            best_epoch = epoch
+
+            patience_counter = 0
+
+            torch.save(
+                model,
+                pkl_name,
+            )
+
+            print(
+                f'*** best VAL checkpoint '
+                f'epoch={epoch} '
+                f'ACC={best_acc:.6f} ***'
+            )
+
         else:
-            error_msg = metrics_dict.get('error', 'Unknown error') if isinstance(metrics_dict, dict) else 'Unknown error'
-            adr_data.append({
-                'ADR_Type': rel,
-                'Accuracy': None,
-                'AUROC': None,
-                'F1': None,
-                'Precision': None,
-                'Recall': None,
-                'Int_AP': None,
-                'AP': None,
-                'Error': error_msg,
-                'Dataset': 'S1'
-            })
-    
-    # Add S2 overall metrics
-    s2_res = s2_results
-    adr_data.append({
-        'ADR_Type': 'Overall_S2',
-        'Accuracy': s2_res['acc'],
-        'AUROC': s2_res['auroc'],
-        'F1': s2_res['f1'],
-        'Precision': s2_res['precision'],
-        'Recall': s2_res['recall'],
-        'Int_AP': s2_res['int_ap'],
-        'AP': s2_res['ap'],
-        'Dataset': 'S2'
-    })
-    
-    # Add S2 per-ADR metrics
-    for rel, metrics_dict in s2_res['rel_metrics'].items():
-        if isinstance(metrics_dict, dict) and 'error' not in metrics_dict:
-            adr_data.append({
-                'ADR_Type': rel,
-                'Accuracy': metrics_dict['acc'],
-                'AUROC': metrics_dict['auroc'],
-                'F1': metrics_dict['f1'],
-                'Precision': metrics_dict['precision'],
-                'Recall': metrics_dict['recall'],
-                'Int_AP': metrics_dict['int_ap'],
-                'AP': metrics_dict['ap'],
-                'Dataset': 'S2'
-            })
-        else:
-            error_msg = metrics_dict.get('error', 'Unknown error') if isinstance(metrics_dict, dict) else 'Unknown error'
-            adr_data.append({
-                'ADR_Type': rel,
-                'Accuracy': None,
-                'AUROC': None,
-                'F1': None,
-                'Precision': None,
-                'Recall': None,
-                'Int_AP': None,
-                'AP': None,
-                'Error': error_msg,
-                'Dataset': 'S2'
-            })
-    
-    # Create DataFrame with the desired ordering:
-    # Overall S1, then per-ADR S1 (sorted by accuracy desc, then ADR_Type asc)
-    # Overall S2, then per-ADR S2 (sorted by accuracy desc, then ADR_Type asc)
-    adr_df = pd.DataFrame(adr_data)
-    
-    # Split into S1 and S2 data
-    s1_data = adr_df[adr_df['Dataset'] == 'S1'].copy()
-    s2_data = adr_df[adr_df['Dataset'] == 'S2'].copy()
-    
-    # For S1: Overall first, then per-ADR sorted by accuracy and ADR_Type
-    s1_overall = s1_data[s1_data['ADR_Type'] == 'Overall_S1']
-    s1_per_adr = s1_data[s1_data['ADR_Type'] != 'Overall_S1'].sort_values(by=['Accuracy', 'ADR_Type'], ascending=[False, True])
-    s1_ordered = pd.concat([s1_overall, s1_per_adr], ignore_index=True)
-    
-    # For S2: Overall first, then per-ADR sorted by accuracy and ADR_Type
-    s2_overall = s2_data[s2_data['ADR_Type'] == 'Overall_S2']
-    s2_per_adr = s2_data[s2_data['ADR_Type'] != 'Overall_S2'].sort_values(by=['Accuracy', 'ADR_Type'], ascending=[False, True])
-    s2_ordered = pd.concat([s2_overall, s2_per_adr], ignore_index=True)
-    
-    # Combine: S1 results first, then S2 results
-    final_adr_df = pd.concat([s1_ordered, s2_ordered], ignore_index=True)
-    
-    # Display the DataFrame
-    pd.set_option('display.max_rows', None)  # Show all rows
-    print(final_adr_df)
-    
-    # Reset display options
-    pd.reset_option('display.max_rows')
-    
-    # Save to CSV
-    final_adr_df.to_csv('per_adr_metrics_separate_models.csv', index=False)
-    print("Per-ADR metrics saved to 'per_adr_metrics_separate_models.csv'")
-    
-    return s1_results, s2_results, final_adr_df
+
+            patience_counter += 1
+
+        if scheduler:
+            scheduler.step()
+
+        n_train = len(
+            train_loader.dataset
+        )
+
+        print(
+            f'Epoch {epoch} '
+            f'({time.time()-start:.2f}s) '
+            f'total={total_sum/n_train:.6f} '
+            f'ddi={ddi_sum/n_train:.6f} '
+            f'cl={cl_sum/n_train:.6f} '
+            f'val_loss={val_m["loss"]:.6f}'
+        )
+
+        print(
+            f'  train '
+            f'ACC/AUROC/AP='
+            f'{train_m["acc"]:.6f}/'
+            f'{train_m["auroc"]:.6f}/'
+            f'{train_m["ap"]:.6f}'
+        )
+
+        print(
+            f'  val   '
+            f'ACC/AUROC/AP='
+            f'{val_m["acc"]:.6f}/'
+            f'{val_m["auroc"]:.6f}/'
+            f'{val_m["ap"]:.6f} '
+            f'patience='
+            f'{patience_counter}/'
+            f'{args.patience}'
+        )
+
+        if (
+            patience_counter
+            >= args.patience
+        ):
+
+            print(
+                f'Early stopping at '
+                f'epoch {epoch}; '
+                f'best epoch='
+                f'{best_epoch}, '
+                f'val ACC='
+                f'{best_acc:.6f}'
+            )
+
+            break
+
+    return (
+        best_epoch,
+        best_acc,
+    )
 
 
-model = models.MVN_DDI(n_atom_feats, n_atom_hid, kge_dim, rel_total, heads_out_feat_params=[64,64,64,64], blocks_params=[2, 2, 2, 2])
-loss = custom_loss.SigmoidLoss()
-optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 0.96 ** (epoch))
-# print(model)
-model.to(device=device)
+def save_results(
+    s1,
+    s2,
+):
 
-# if __name__ == '__main__':
-# Train with separate model saving
-train(model, train_data_loader, s1_data_loader, s2_data_loader, loss, optimizer, n_epochs, device, scheduler)
+    rows = []
 
-# Test with separate best models
-s1_results, s2_results, adr_df = test_separate_models(s1_data_loader, s2_data_loader)
+    for name, result in [
+        ('S1', s1),
+        ('S2', s2),
+    ]:
+
+        rows.append({
+            'Dataset':
+                name,
+
+            'Relation':
+                'Overall',
+
+            'ACC':
+                result['acc'],
+
+            'AUROC':
+                result['auroc'],
+
+            'AP':
+                result['ap'],
+
+            'F1':
+                result['f1'],
+
+            'Precision':
+                result['precision'],
+
+            'Recall':
+                result['recall'],
+        })
+
+        for rel, value in (
+            result['per_rel'].items()
+        ):
+
+            row = {
+                'Dataset':
+                    name,
+
+                'Relation':
+                    rel,
+            }
+
+            if (
+                'error'
+                in value
+            ):
+
+                row['Error'] = (
+                    value['error']
+                )
+
+            else:
+
+                row.update({
+                    'ACC':
+                        value['acc'],
+
+                    'AUROC':
+                        value['auroc'],
+
+                    'AP':
+                        value['ap'],
+
+                    'F1':
+                        value['f1'],
+
+                    'Precision':
+                        value['precision'],
+
+                    'Recall':
+                        value['recall'],
+                })
+
+            rows.append(row)
+
+    out = pd.DataFrame(
+        rows
+    )
+
+    out_file = (
+        f'inductive_drugbank_'
+        f'fold{args.fold}_'
+        f'seed{args.seed}_'
+        f'per_relation_metrics.csv'
+    )
+
+    out.to_csv(
+        out_file,
+        index=False,
+    )
+
+    print(
+        f'Saved {out_file}'
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+model = models.MVN_DDI(
+    args.n_atom_feats,
+    args.n_atom_hid,
+    args.kge_dim,
+    args.rel_total,
+    heads_out_feat_params=[
+        64,
+        64,
+        64,
+        64,
+    ],
+    blocks_params=[
+        2,
+        2,
+        2,
+        2,
+    ],
+).to(device)
+
+loss_fn = (
+    custom_loss.SigmoidLoss()
+)
+
+optimizer = optim.Adam(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.weight_decay,
+)
+
+scheduler = (
+    optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda epoch:
+            0.96 ** epoch,
+    )
+)
+
+best_epoch, best_val_acc = (
+    train(
+        model,
+        loss_fn,
+        optimizer,
+        scheduler,
+    )
+)
+
+print(
+    '\nLoading ONE checkpoint '
+    'selected only by validation...'
+)
+
+best_model = torch.load(
+    pkl_name,
+    map_location=device,
+)
+
+best_model.to(device)
+
+# ============================================================
+# FINAL TEST
+#
+# S1/S2 first appear only after
+# checkpoint selection has completed.
+# ============================================================
+
+s1_result = evaluate(
+    s1_loader,
+    best_model,
+    loss_fn,
+    per_rel=True,
+)
+
+s2_result = evaluate(
+    s2_loader,
+    best_model,
+    loss_fn,
+    per_rel=True,
+)
+
+print()
+print(
+    '===== FINAL INDUCTIVE TEST ====='
+)
+
+print(
+    f'best_epoch={best_epoch} '
+    f'best_val_ACC='
+    f'{best_val_acc:.6f}'
+)
+
+for name, result in [
+    ('S1', s1_result),
+    ('S2', s2_result),
+]:
+
+    print(
+        f'{name} '
+        f'ACC/AUROC/AP/F1/'
+        f'Precision/Recall='
+        f'{result["acc"]:.6f}/'
+        f'{result["auroc"]:.6f}/'
+        f'{result["ap"]:.6f}/'
+        f'{result["f1"]:.6f}/'
+        f'{result["precision"]:.6f}/'
+        f'{result["recall"]:.6f}'
+    )
+
+save_results(
+    s1_result,
+    s2_result,
+)

@@ -25,22 +25,23 @@ from data_preprocessing import (
 warnings.filterwarnings('ignore', category=UserWarning)
 
 # =========================================================
-# Parameters: keep the official FG-DDI transductive protocol
-# unchanged; Stage 04 only adds CL hyperparameters.
+# Parameters: preserve the official TWOSIDES optimization
+# defaults while using the frozen clean TWOSIDES protocol.
+# Stage 04 adds auxiliary contrastive learning.
 # =========================================================
 parser = argparse.ArgumentParser()
 parser.add_argument('--n_atom_feats', type=int, default=55)
 parser.add_argument('--n_atom_hid', type=int, default=128)
-parser.add_argument('--rel_total', type=int, default=86)
+parser.add_argument('--rel_total', type=int, default=963)
 parser.add_argument('--lr', type=float, default=0.01)
-parser.add_argument('--n_epochs', type=int, default=200)
+parser.add_argument('--n_epochs', type=int, default=100)
 parser.add_argument('--kge_dim', type=int, default=128)
-parser.add_argument('--batch_size', type=int, default=1024)
+parser.add_argument('--batch_size', type=int, default=2048)
 parser.add_argument('--weight_decay', type=float, default=5e-4)
 parser.add_argument('--neg_samples', type=int, default=1)
 parser.add_argument('--data_size_ratio', type=int, default=1)
 parser.add_argument('--use_cuda', type=bool, default=True, choices=[0, 1])
-parser.add_argument('--pkl_name', type=str, default='transductive_drugbank.pkl')
+parser.add_argument('--pkl_name', type=str, default='transductive_twosides.pkl')
 parser.add_argument('--repeat', type=int, default=0, choices=[0, 1, 2])
 parser.add_argument('--seed', type=int, default=0)
 
@@ -82,9 +83,9 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # Avoid overwriting checkpoints across repeats/seeds.
-if pkl_name == 'transductive_drugbank.pkl':
+if pkl_name == 'transductive_twosides.pkl':
     pkl_name = (
-        f'transductive_drugbank_'
+        f'transductive_twosides_'
         f'repeat{repeat}_seed{seed}.pkl'
     )
 
@@ -101,7 +102,7 @@ print(
 protocol_dir = (
     Path(__file__).resolve().parents[1]
     / "protocol"
-    / "drugbank_transductive"
+    / "twosides"
     / f"repeat{repeat}"
 )
 
@@ -126,7 +127,7 @@ precompute_functional_groups()
 print('Functional group setup complete.')
 
 # =========================================================
-# Dataset: frozen clean DrugBank transductive splits
+# Dataset: frozen clean TWOSIDES pair-disjoint splits
 # =========================================================
 
 df_ddi_train = pd.read_csv(protocol_dir / "train.csv")
@@ -171,6 +172,8 @@ train_data = DrugDataset(
     ratio=data_size_ratio,
     neg_ent=neg_samples,
 )
+
+# Frozen validation positives + deterministic fixed negatives.
 val_data = DrugDataset(
     val_tup,
     ratio=data_size_ratio,
@@ -178,17 +181,19 @@ val_data = DrugDataset(
     shuffle=False,
     fixed_negative_file=(
         protocol_dir
-        / "val_negatives.csv"
+        / "val_negatives.csv.gz"
     ),
 )
 
+# Frozen test positives + deterministic fixed negatives.
 test_data = DrugDataset(
     test_tup,
+    ratio=data_size_ratio,
     disjoint_split=False,
     shuffle=False,
     fixed_negative_file=(
         protocol_dir
-        / "test_negatives.csv"
+        / "test_negatives.csv.gz"
     ),
 )
 

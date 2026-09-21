@@ -1,8 +1,3 @@
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DRUGBANK_DIR = PROJECT_ROOT / "drugbank"
-FG_STATS_FILE = Path(__file__).resolve().parent / "functional_group_statistics_full.csv"
 import itertools
 from collections import defaultdict
 from operator import neg
@@ -28,12 +23,23 @@ FG_ENRICHMENT_SCORES = {}
 DRUG_TO_FUNCTIONAL_GROUPS = {}
 DRUG_TO_INTRA_ENRICHMENT = {}  # Cache for intra-molecular enrichment scores
 
-def load_fg_enrichment_scores():
+def load_fg_enrichment_scores(csv_path):
     global FG_ENRICHMENT_SCORES
-    df = pd.read_csv(FG_STATS_FILE)
+
+    FG_ENRICHMENT_SCORES = {}
+
+    df = pd.read_csv(csv_path)
+
     for _, row in df.iterrows():
-        FG_ENRICHMENT_SCORES[(row['fg1'], row['fg2'])] = row['enrichment']
-        FG_ENRICHMENT_SCORES[(row['fg2'], row['fg1'])] = row['enrichment']
+        FG_ENRICHMENT_SCORES[(row['fg1'], row['fg2'])] = float(row['enrichment'])
+        FG_ENRICHMENT_SCORES[(row['fg2'], row['fg1'])] = float(row['enrichment'])
+
+    return {
+        "rows": len(df),
+        "min_enrichment": float(df["enrichment"].min()),
+        "median_enrichment": float(df["enrichment"].median()),
+        "max_enrichment": float(df["enrichment"].max()),
+    }
 
 def get_molecule_functional_groups(mol):
     """Get functional groups for a molecule"""
@@ -70,7 +76,7 @@ def precompute_functional_groups():
     print(f"Precomputed enrichment scores for {len(DRUG_TO_INTRA_ENRICHMENT)} drugs.")
 
 
-df_drugs_smiles = pd.read_csv(DRUGBANK_DIR / 'drug_smiles.csv')
+df_drugs_smiles = pd.read_csv('drugbank_test/drugbank/drug_smiles.csv')
 
 DRUG_TO_INDX_DICT = {drug_id: indx for indx, drug_id in enumerate(df_drugs_smiles['drug_id'])}
 
@@ -199,7 +205,7 @@ def get_mol_edge_list_and_feat_mtx(mol_graph):
     edge_list = torch.LongTensor([(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol_graph.GetBonds()])
     undirected_edge_list = torch.cat([edge_list, edge_list[:, [1, 0]]], dim=0) if len(edge_list) else edge_list 
     # Fix PyTorch deprecation warning: use .mT instead of .T for 2D tensors
-    return undirected_edge_list.t() if undirected_edge_list.dim() == 2 else undirected_edge_list.T, n_features
+    return undirected_edge_list.mT if undirected_edge_list.dim() == 2 else undirected_edge_list.T, n_features
 
 def compute_intra_molecular_enrichment_weights(drug_id, num_edges):
     """
@@ -238,15 +244,13 @@ TOTAL_ATOM_FEATS = (next(iter(MOL_EDGE_LIST_FEAT_MTX.values()))[1].shape[-1])
 
 
 ##### DDI statistics and counting #######
-df_all_pos_ddi = pd.read_csv(DRUGBANK_DIR / 'ddis.csv')
-all_pos_tup = [(h, t, r) for h, t, r in zip(df_all_pos_ddi['d1'], df_all_pos_ddi['d2'], df_all_pos_ddi['type'])]
-
 
 ALL_DRUG_IDS, _ = zip(*drug_id_mol_graph_tup)
 ALL_DRUG_IDS = np.array(list(set(ALL_DRUG_IDS)))
+
+# These statistics MUST be built from the current training split only.
 ALL_TRUE_H_WITH_TR = defaultdict(list)
 ALL_TRUE_T_WITH_HR = defaultdict(list)
-
 FREQ_REL = defaultdict(int)
 ALL_H_WITH_R = defaultdict(dict)
 ALL_T_WITH_R = defaultdict(dict)
@@ -254,23 +258,90 @@ ALL_TAIL_PER_HEAD = {}
 ALL_HEAD_PER_TAIL = {}
 
 
-for h, t, r in all_pos_tup:
-    ALL_TRUE_H_WITH_TR[(t, r)].append(h)
-    ALL_TRUE_T_WITH_HR[(h, r)].append(t)
-    FREQ_REL[r] += 1.0
-    ALL_H_WITH_R[r][h] = 1
-    ALL_T_WITH_R[r][t] = 1
+def configure_ddi_statistics(tri_list):
+    """
+    Build negative-sampling statistics from the current TRAINING triples only.
 
-for t, r in ALL_TRUE_H_WITH_TR:
-    ALL_TRUE_H_WITH_TR[(t, r)] = np.array(list(set(ALL_TRUE_H_WITH_TR[(t, r)])))
-for h, r in ALL_TRUE_T_WITH_HR:
-    ALL_TRUE_T_WITH_HR[(h, r)] = np.array(list(set(ALL_TRUE_T_WITH_HR[(h, r)])))
+    Parameters
+    ----------
+    tri_list : iterable of (head_drug, tail_drug, relation)
 
-for r in FREQ_REL:
-    ALL_H_WITH_R[r] = np.array(list(ALL_H_WITH_R[r].keys()))
-    ALL_T_WITH_R[r] = np.array(list(ALL_T_WITH_R[r].keys()))
-    ALL_HEAD_PER_TAIL[r] = FREQ_REL[r] / len(ALL_T_WITH_R[r])
-    ALL_TAIL_PER_HEAD[r] = FREQ_REL[r] / len(ALL_H_WITH_R[r])
+    Notes
+    -----
+    Validation/test triples must never be passed here.
+    """
+    global ALL_TRUE_H_WITH_TR
+    global ALL_TRUE_T_WITH_HR
+    global FREQ_REL
+    global ALL_H_WITH_R
+    global ALL_T_WITH_R
+    global ALL_TAIL_PER_HEAD
+    global ALL_HEAD_PER_TAIL
+
+    true_h_with_tr = defaultdict(list)
+    true_t_with_hr = defaultdict(list)
+
+    freq_rel = defaultdict(int)
+    h_with_r = defaultdict(dict)
+    t_with_r = defaultdict(dict)
+
+    tail_per_head = {}
+    head_per_tail = {}
+
+    n_triples = 0
+
+    for h, t, r in tri_list:
+        r = int(r)
+
+        true_h_with_tr[(t, r)].append(h)
+        true_t_with_hr[(h, r)].append(t)
+
+        freq_rel[r] += 1.0
+        h_with_r[r][h] = 1
+        t_with_r[r][t] = 1
+
+        n_triples += 1
+
+    for key in list(true_h_with_tr.keys()):
+        true_h_with_tr[key] = np.array(
+            list(set(true_h_with_tr[key]))
+        )
+
+    for key in list(true_t_with_hr.keys()):
+        true_t_with_hr[key] = np.array(
+            list(set(true_t_with_hr[key]))
+        )
+
+    for r in freq_rel:
+        h_with_r[r] = np.array(
+            list(h_with_r[r].keys())
+        )
+        t_with_r[r] = np.array(
+            list(t_with_r[r].keys())
+        )
+
+        head_per_tail[r] = (
+            freq_rel[r] / len(t_with_r[r])
+        )
+
+        tail_per_head[r] = (
+            freq_rel[r] / len(h_with_r[r])
+        )
+
+    ALL_TRUE_H_WITH_TR = true_h_with_tr
+    ALL_TRUE_T_WITH_HR = true_t_with_hr
+    FREQ_REL = freq_rel
+    ALL_H_WITH_R = h_with_r
+    ALL_T_WITH_R = t_with_r
+    ALL_TAIL_PER_HEAD = tail_per_head
+    ALL_HEAD_PER_TAIL = head_per_tail
+
+    return {
+        "num_triples": n_triples,
+        "num_relations": len(freq_rel),
+        "num_true_hr_keys": len(true_t_with_hr),
+        "num_true_tr_keys": len(true_h_with_tr),
+    }
 
 
 #######    ****** ###############
@@ -290,30 +361,153 @@ class BipartiteData(Data):
 
 
 class DrugDataset(Dataset):
-    def __init__(self, tri_list, ratio=1.0, neg_ent=1, disjoint_split=True, shuffle=True):
+    def __init__(
+        self,
+        tri_list,
+        ratio=1.0,
+        neg_ent=1,
+        disjoint_split=True,
+        shuffle=True,
+        fixed_negative_file=None,
+    ):
         self.neg_ent = neg_ent
         self.tri_list = []
         self.ratio = ratio
+        self.fixed_negative_map = None
 
         for h, t, r in tri_list:
-            if ((h in MOL_EDGE_LIST_FEAT_MTX) and (t in MOL_EDGE_LIST_FEAT_MTX)):
-                self.tri_list.append((h, t, r))
+            if (
+                h in MOL_EDGE_LIST_FEAT_MTX
+                and t in MOL_EDGE_LIST_FEAT_MTX
+            ):
+                self.tri_list.append(
+                    (h, t, int(r))
+                )
+
         if disjoint_split:
             d1, d2, *_ = zip(*self.tri_list)
-            self.drug_ids = np.array(list(set(d1 + d2)))
+            self.drug_ids = np.array(
+                list(set(d1 + d2))
+            )
         else:
-            self.drug_ids = ALL_DRUG_IDS
+            self.drug_ids = ALL_DRUG_IDS.copy()
 
-        self.drug_ids = np.array([id for id in self.drug_ids if id in MOL_EDGE_LIST_FEAT_MTX])
-        
         if shuffle:
             random.shuffle(self.tri_list)
-        limit = math.ceil(len(self.tri_list) * ratio)
+
+        limit = math.ceil(
+            len(self.tri_list) * ratio
+        )
         self.tri_list = self.tri_list[:limit]
 
-        # Cache only the MOL_EDGE_LIST_FEAT_MTX lookups
-        self.mol_cache = {drug_id: MOL_EDGE_LIST_FEAT_MTX[drug_id] 
-                         for drug_id in self.drug_ids}
+        # ----------------------------------------------------
+        # Fixed negatives are used ONLY for validation/test.
+        # Training leaves fixed_negative_file=None and keeps
+        # the original dynamic negative sampling behavior.
+        # ----------------------------------------------------
+        if fixed_negative_file is not None:
+
+            fixed_df = pd.read_csv(
+                fixed_negative_file
+            )
+
+            required_columns = {
+                "pos_d1",
+                "pos_d2",
+                "type",
+                "neg_d1",
+                "neg_d2",
+            }
+
+            missing = (
+                required_columns
+                - set(fixed_df.columns)
+            )
+
+            if missing:
+                raise ValueError(
+                    "Missing fixed-negative columns: "
+                    f"{sorted(missing)}"
+                )
+
+            self.fixed_negative_map = {}
+
+            for row in fixed_df.itertuples(
+                index=False
+            ):
+                key = (
+                    str(row.pos_d1),
+                    str(row.pos_d2),
+                    int(row.type),
+                )
+
+                if key in self.fixed_negative_map:
+                    raise ValueError(
+                        "Duplicate fixed-negative key: "
+                        f"{key}"
+                    )
+
+                self.fixed_negative_map[key] = (
+                    str(row.neg_d1),
+                    str(row.neg_d2),
+                )
+
+            expected_keys = {
+                (
+                    str(h),
+                    str(t),
+                    int(r),
+                )
+                for h, t, r in self.tri_list
+            }
+
+            fixed_keys = set(
+                self.fixed_negative_map
+            )
+
+            if expected_keys != fixed_keys:
+                missing_keys = (
+                    expected_keys - fixed_keys
+                )
+                extra_keys = (
+                    fixed_keys - expected_keys
+                )
+
+                raise ValueError(
+                    "Fixed negatives do not match "
+                    "evaluation positives: "
+                    f"missing={len(missing_keys)}, "
+                    f"extra={len(extra_keys)}"
+                )
+
+            fixed_drug_ids = {
+                drug_id
+                for pair in
+                self.fixed_negative_map.values()
+                for drug_id in pair
+            }
+
+            self.drug_ids = np.array(
+                list(
+                    set(self.drug_ids.tolist())
+                    | fixed_drug_ids
+                )
+            )
+
+        self.drug_ids = np.array([
+            drug_id
+            for drug_id in self.drug_ids
+            if drug_id
+            in MOL_EDGE_LIST_FEAT_MTX
+        ])
+
+        self.mol_cache = {
+            drug_id:
+                MOL_EDGE_LIST_FEAT_MTX[
+                    drug_id
+                ]
+            for drug_id in self.drug_ids
+        }
 
     def __len__(self):
         return len(self.tri_list)
@@ -401,29 +595,189 @@ class DrugDataset(Dataset):
                                              h_data.x, t_data.x, h, t)
             pos_b_samples.append(pos_b_graph)
 
-            neg_heads, neg_tails = self.__normal_batch(h, t, r, self.neg_ent)
- 
-            for neg_h in neg_heads:
+            if self.fixed_negative_map is not None:
+
+                key = (
+                    str(h),
+                    str(t),
+                    int(r),
+                )
+
+                if key not in self.fixed_negative_map:
+                    raise KeyError(
+                        "No fixed negative found for "
+                        f"{key}"
+                    )
+
+                neg_h, neg_t = (
+                    self.fixed_negative_map[
+                        key
+                    ]
+                )
+
                 neg_rels.append(r)
-                neg_edge_index, neg_features = self.mol_cache[neg_h]
-                neg_h_data = self._create_enhanced_data_object(neg_h, neg_edge_index, neg_features)
-                neg_h_samples.append(neg_h_data)
-                neg_t_samples.append(t_data)
 
-                neg_b_graph = self._create_b_graph(get_bipartite_graph(drug_to_mol_graph[neg_h], drug_to_mol_graph[t]), 
-                                                 neg_h_data.x, t_data.x, neg_h, t)
-                neg_b_samples.append(neg_b_graph)
+                (
+                    neg_h_edge_index,
+                    neg_h_features,
+                ) = self.mol_cache[neg_h]
 
-            for neg_t in neg_tails:
-                neg_rels.append(r)
-                neg_h_samples.append(h_data)
-                neg_edge_index, neg_features = self.mol_cache[neg_t]
-                neg_t_data = self._create_enhanced_data_object(neg_t, neg_edge_index, neg_features)
-                neg_t_samples.append(neg_t_data)
+                (
+                    neg_t_edge_index,
+                    neg_t_features,
+                ) = self.mol_cache[neg_t]
 
-                neg_b_graph = self._create_b_graph(get_bipartite_graph(drug_to_mol_graph[h], drug_to_mol_graph[neg_t]),
-                                                 h_data.x, neg_t_data.x, h, neg_t)
-                neg_b_samples.append(neg_b_graph)
+                neg_h_data = (
+                    self._create_enhanced_data_object(
+                        neg_h,
+                        neg_h_edge_index,
+                        neg_h_features,
+                    )
+                )
+
+                neg_t_data = (
+                    self._create_enhanced_data_object(
+                        neg_t,
+                        neg_t_edge_index,
+                        neg_t_features,
+                    )
+                )
+
+                neg_h_samples.append(
+                    neg_h_data
+                )
+                neg_t_samples.append(
+                    neg_t_data
+                )
+
+                neg_b_graph = (
+                    self._create_b_graph(
+                        get_bipartite_graph(
+                            drug_to_mol_graph[
+                                neg_h
+                            ],
+                            drug_to_mol_graph[
+                                neg_t
+                            ],
+                        ),
+                        neg_h_data.x,
+                        neg_t_data.x,
+                        neg_h,
+                        neg_t,
+                    )
+                )
+
+                neg_b_samples.append(
+                    neg_b_graph
+                )
+
+            else:
+                # Original dynamic negative sampling.
+                # This path is used by TRAIN only.
+                neg_heads, neg_tails = (
+                    self.__normal_batch(
+                        h,
+                        t,
+                        r,
+                        self.neg_ent,
+                    )
+                )
+
+                for neg_h in neg_heads:
+
+                    neg_rels.append(r)
+
+                    (
+                        neg_edge_index,
+                        neg_features,
+                    ) = self.mol_cache[
+                        neg_h
+                    ]
+
+                    neg_h_data = (
+                        self._create_enhanced_data_object(
+                            neg_h,
+                            neg_edge_index,
+                            neg_features,
+                        )
+                    )
+
+                    neg_h_samples.append(
+                        neg_h_data
+                    )
+
+                    neg_t_samples.append(
+                        t_data
+                    )
+
+                    neg_b_graph = (
+                        self._create_b_graph(
+                            get_bipartite_graph(
+                                drug_to_mol_graph[
+                                    neg_h
+                                ],
+                                drug_to_mol_graph[
+                                    t
+                                ],
+                            ),
+                            neg_h_data.x,
+                            t_data.x,
+                            neg_h,
+                            t,
+                        )
+                    )
+
+                    neg_b_samples.append(
+                        neg_b_graph
+                    )
+
+                for neg_t in neg_tails:
+
+                    neg_rels.append(r)
+
+                    neg_h_samples.append(
+                        h_data
+                    )
+
+                    (
+                        neg_edge_index,
+                        neg_features,
+                    ) = self.mol_cache[
+                        neg_t
+                    ]
+
+                    neg_t_data = (
+                        self._create_enhanced_data_object(
+                            neg_t,
+                            neg_edge_index,
+                            neg_features,
+                        )
+                    )
+
+                    neg_t_samples.append(
+                        neg_t_data
+                    )
+
+                    neg_b_graph = (
+                        self._create_b_graph(
+                            get_bipartite_graph(
+                                drug_to_mol_graph[
+                                    h
+                                ],
+                                drug_to_mol_graph[
+                                    neg_t
+                                ],
+                            ),
+                            h_data.x,
+                            neg_t_data.x,
+                            h,
+                            neg_t,
+                        )
+                    )
+
+                    neg_b_samples.append(
+                        neg_b_graph
+                    )
 
         pos_h_samples = Batch.from_data_list(pos_h_samples)
         pos_t_samples = Batch.from_data_list(pos_t_samples)
@@ -464,12 +818,3 @@ class DrugDataset(Dataset):
 class DrugDataLoader(DataLoader):
     def __init__(self, data, **kwargs):
         super().__init__(data, collate_fn=data.collate_fn, **kwargs)
-
-FG_PAIR_TO_ENRICHMENT = {}
-
-def precompute_fg_pair_enrichment():
-    global FG_PAIR_TO_ENRICHMENT
-    df = pd.read_csv(FG_STATS_FILE)
-    for _, row in df.iterrows():
-        FG_PAIR_TO_ENRICHMENT[(row['fg1'], row['fg2'])] = row['enrichment']
-        FG_PAIR_TO_ENRICHMENT[(row['fg2'], row['fg1'])] = row['enrichment']

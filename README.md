@@ -1,68 +1,58 @@
 # SGAR-DDI
 
-## Requirement
+## Requirements
 
-To run the code, the following dependencies are required:
-
-- Python == 3.7.12
-- PyTorch == 1.9.0
-- CUDA Toolkit == 11.1
-- PyTorch Geometric == 2.0.3
-- RDKit == 2020.09.1
+- Python 3.10
+- PyTorch 2.0.1
+- CUDA 11.8
+- PyTorch Geometric 2.3.1
+- RDKit
+- NumPy
+- Pandas
+- scikit-learn
 
 ## Installation
 
-You can create a virtual environment using Conda:
-
-```bash
-bash Install
-```
-
-Then activate the environment:
-
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate sgar_ddi
-```
-
-Alternatively, you can create the environment using `environment.yml`:
+Create the environment with Conda:
 
 ```bash
 conda env create -f environment.yml
 conda activate sgar_ddi
 ```
 
+Alternatively:
+
+```bash
+bash Install
+conda activate sgar_ddi
+```
+
 ## Dataset
 
-The processed datasets used in this study were obtained from the DSN-DDI repository:
+The processed datasets are based on the DSN-DDI repository:
 
 https://github.com/microsoft/Drug-Interaction-Research/blob/DSN-DDI-for-DDI-Prediction/DSN-DDI-dataset.zip
 
-After downloading and extracting the dataset, place the following data folders in the root directory of SGAR-DDI:
-
-```text
-SGAR-DDI/
-├── drugbank/
-├── inductive_data/
-└── twosides/
-```
+Download and extract the dataset before running the experiments.
 
 ## Run
 
-Run the DrugBank inductive experiment:
+DrugBank transductive:
 
 ```bash
-python "drugbank_test - inductive/inductive_train.py"
+python "drugbank_test - transductive/transductive_train.py" --repeat 0 --seed 0
 ```
 
-Run the DrugBank transductive experiment:
+DrugBank inductive:
 
 ```bash
-python "drugbank_test - transductive/transductive_train.py"
+python "drugbank_test - inductive/inductive_train.py" --fold 0 --seed 0
 ```
 
-Run the TWOSIDES experiment:
+TWOSIDES:
 
 ```bash
-python "twosides_test/train.py"
+python "twosides_test/train_script.py" --repeat 0 --seed 0
 ```
+
+Use repeat/fold values `0`, `1`, and `2` for the three experimental runs.
