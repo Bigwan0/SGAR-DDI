@@ -52,3 +52,22 @@ python "twosides_test/train_script.py" --repeat 0 --seed 0
 Use repeat/fold values `0`, `1`, and `2` for the three experimental runs.
 ```text
 Update README installation instructions
+## Reproducing the Main Results and Figures
+
+The main experimental results can be reproduced using the training and evaluation procedures described in this repository.
+
+### Experimental Results
+
+The DrugBank transductive and inductive experiments and the TWOSIDES transductive experiments can be run using the corresponding commands provided above. The reported performance metrics are aggregated across three repetitions or predefined folds.
+
+### Tables and Figures
+
+The performance tables are compiled from the evaluation metrics obtained for each repetition or fold. The ablation results are obtained by evaluating the corresponding model variants under the same experimental settings.
+
+ROC and precision–recall curves can be generated from the ground-truth labels and prediction scores obtained during evaluation. Other performance figures can be reconstructed from the corresponding evaluation metrics.
+
+The original plotting scripts and saved prediction outputs are not included in this repository.
+
+### Reproducibility Settings
+
+The environment configuration is provided in `environment.yml`. The experimental hyperparameters, validation procedure, and checkpoint-selection criterion are described in the manuscript and Supporting Information.
